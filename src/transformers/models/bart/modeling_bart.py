@@ -261,12 +261,14 @@ class BartAttention(nn.Module):
         
         ### NEW ###
         if is_cross_attention and cross_attention_bias is not None:
+            # breakpoint()
             # print('Biasing cross attention')
             if cross_attention_bias.size() != (bsz, 1, tgt_len, src_len):
                 raise ValueError(
                     f"Attention bias should be of size {(bsz, 1, tgt_len, src_len)}, but is {cross_attention_bias.size()}"
                 )
 
+            # breakpoint()
             # elementwise multiplication
             attn_weights = torch.mul(attn_weights.view(bsz, self.num_heads, tgt_len, src_len), cross_attention_bias)
             # attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) * cross_attention_bias
@@ -276,7 +278,7 @@ class BartAttention(nn.Module):
             attn_weights = nn.functional.normalize(attn_weights, p=1.0, dim=-1) # L1 norm -> elements sum to 1
             # attn_weights = nn.functional.normalize(attn_weights, dim=-1) # L2 norm -> elements do NOT sum to 1
             # attn_weights = nn.functional.softmax(attn_weights, dim=-1) # softmax
-
+        
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):
                 raise ValueError(
@@ -973,6 +975,7 @@ class BartDecoder(BartPretrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cross_attention_bias: Optional[torch.Tensor] = None,
+        context_code: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         r"""
         Args:
@@ -1067,19 +1070,25 @@ class BartDecoder(BartPretrainedModel):
             attention_mask, input_shape, inputs_embeds, past_key_values_length
         )
 
+        ### NEW: AUG CXT ###
+        if encoder_hidden_states is not None and context_code is not None:
+            # [bsz x src_seq_len, hidden_size] -> [bsz x encoded_context_code_len + src_seq_len, hidden_size]
+            encoder_hidden_states = torch.cat([context_code, encoder_hidden_states], dim=1)
+            # update encoder_attention_mask to match encoded_context_code_len + src_seq_len          
+            context_code_attention_mask = torch.ones_like(context_code[:, :, 0]) # [bs x encoded_context_code_len]
+            encoder_attention_mask = torch.cat([context_code_attention_mask, encoder_attention_mask], dim=1) # [bs x encoded_context_code_len + src_seq_len]
+
         # expand encoder attention mask
         if encoder_hidden_states is not None and encoder_attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             encoder_attention_mask = _expand_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
 
-        ### NEW ###
+        ### NEW: X-ATT BIAS ###
         if encoder_hidden_states is not None and cross_attention_bias is not None:
-            # print('Received cross_attention_bias')
-            cross_attention_bias = cross_attention_bias.repeat(input_shape) # TODO check if this is correct for batch_size > 1
+            # cross_attention_bias = cross_attention_bias.repeat(input_shape[0], 1) # NOTE: removed due to expansion in generation_utils
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            # breakpoint()
             cross_attention_bias = _expand_cross_attention_bias(cross_attention_bias, inputs_embeds.dtype, tgt_len=input_shape[-1])
-
+    
         # embed positions
         positions = self.embed_positions(input_shape, past_key_values_length)
 
@@ -1242,6 +1251,7 @@ class BartModel(BartPretrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cross_attention_bias: Optional[torch.Tensor] = None,
+        context_code: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, Seq2SeqModelOutput]:
 
         # different to other models, Bart automatically creates decoder_input_ids from
@@ -1298,6 +1308,7 @@ class BartModel(BartPretrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cross_attention_bias=cross_attention_bias,
+            context_code=context_code,
         )
 
         if not return_dict:
@@ -1379,6 +1390,7 @@ class BartForConditionalGeneration(BartPretrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cross_attention_bias: Optional[torch.Tensor] = None,
+        context_code: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1415,7 +1427,8 @@ class BartForConditionalGeneration(BartPretrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            cross_attention_bias=cross_attention_bias
+            cross_attention_bias=cross_attention_bias,
+            context_code=context_code,
         )
         lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
 
@@ -1458,9 +1471,11 @@ class BartForConditionalGeneration(BartPretrainedModel):
 
         
         decoder_kwargs = kwargs.get('decoder_kwargs', None)
+        # cross attention bias control knob
         cross_attention_bias = decoder_kwargs.get('cross_attention_bias', None) if decoder_kwargs is not None else None
+        # aug context code control knob
+        context_code = decoder_kwargs.get('context_code', None) if decoder_kwargs is not None else None
 
-        # breakpoint()
         return {
             "input_ids": None,  # encoder_outputs is defined. input_ids not needed
             "encoder_outputs": encoder_outputs,
@@ -1471,7 +1486,8 @@ class BartForConditionalGeneration(BartPretrainedModel):
             "decoder_head_mask": decoder_head_mask,
             "cross_attn_head_mask": cross_attn_head_mask,
             "use_cache": use_cache,  # change this to avoid caching (presumably for debugging)
-            "cross_attention_bias": cross_attention_bias # Added for cross attention bias (Hazarika et al. 2022)
+            "cross_attention_bias": cross_attention_bias, # Added for cross attention bias (Hazarika et al. 2022)
+            "context_code": context_code # Added for context code (Hazarika et al. 2022)
         }
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):

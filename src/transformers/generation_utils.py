@@ -590,6 +590,11 @@ class GenerationMixin:
         if attention_mask is not None:
             model_kwargs["attention_mask"] = attention_mask.index_select(0, expanded_return_idx)
 
+        decoder_kwargs = model_kwargs.get('decoder_kwargs') # Added for cross attention bias (Hazarika et al. 2022)
+        if decoder_kwargs is not None:
+            decoder_kwargs['cross_attention_bias'] = decoder_kwargs['cross_attention_bias'].index_select(0, expanded_return_idx) if decoder_kwargs.get('cross_attention_bias') is not None else None
+            decoder_kwargs['context_code'] = decoder_kwargs['context_code'].index_select(0, expanded_return_idx) if decoder_kwargs.get('context_code') is not None else None
+
         if is_encoder_decoder:
             if encoder_outputs is None:
                 raise ValueError("If `is_encoder_decoder` is True, make sure that `encoder_outputs` is defined.")
