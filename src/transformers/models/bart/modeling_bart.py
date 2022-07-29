@@ -116,6 +116,21 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
+def _expand_cross_attention_bias(cross_attention_bias: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+    """
+    Expands cross_attention_bias from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    """
+    bsz, src_len = cross_attention_bias.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+
+    expanded_cross_attention_bias = cross_attention_bias[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+    
+    # inverted_cross_attention_bias = 1.0 - expanded_cross_attention_bias
+
+    # return inverted_cross_attention_bias.masked_fill(inverted_cross_attention_bias.to(torch.bool), torch.finfo(dtype).min)
+    
+    return expanded_cross_attention_bias
+
 
 class BartLearnedPositionalEmbedding(nn.Embedding):
     """
@@ -178,6 +193,7 @@ class BartAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        cross_attention_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -242,6 +258,24 @@ class BartAttention(nn.Module):
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        
+        ### NEW ###
+        if is_cross_attention and cross_attention_bias is not None:
+            # print('Biasing cross attention')
+            if cross_attention_bias.size() != (bsz, 1, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention bias should be of size {(bsz, 1, tgt_len, src_len)}, but is {cross_attention_bias.size()}"
+                )
+
+            # elementwise multiplication
+            attn_weights = torch.mul(attn_weights.view(bsz, self.num_heads, tgt_len, src_len), cross_attention_bias)
+            # attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) * cross_attention_bias
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+            # re-normalize so that the outcome is still a probability distribution
+            attn_weights = nn.functional.normalize(attn_weights, p=1.0, dim=-1) # L1 norm -> elements sum to 1
+            # attn_weights = nn.functional.normalize(attn_weights, dim=-1) # L2 norm -> elements do NOT sum to 1
+            # attn_weights = nn.functional.softmax(attn_weights, dim=-1) # softmax
 
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):
@@ -390,6 +424,7 @@ class BartDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = True,
+        cross_attention_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -441,6 +476,7 @@ class BartDecoderLayer(nn.Module):
                 layer_head_mask=cross_attn_layer_head_mask,
                 past_key_value=cross_attn_past_key_value,
                 output_attentions=output_attentions,
+                cross_attention_bias=cross_attention_bias
             )
             hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
             hidden_states = residual + hidden_states
@@ -936,6 +972,7 @@ class BartDecoder(BartPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cross_attention_bias: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         r"""
         Args:
@@ -1035,6 +1072,14 @@ class BartDecoder(BartPretrainedModel):
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             encoder_attention_mask = _expand_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
 
+        ### NEW ###
+        if encoder_hidden_states is not None and cross_attention_bias is not None:
+            # print('Received cross_attention_bias')
+            cross_attention_bias = cross_attention_bias.repeat(input_shape) # TODO check if this is correct for batch_size > 1
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            # breakpoint()
+            cross_attention_bias = _expand_cross_attention_bias(cross_attention_bias, inputs_embeds.dtype, tgt_len=input_shape[-1])
+
         # embed positions
         positions = self.embed_positions(input_shape, past_key_values_length)
 
@@ -1107,6 +1152,7 @@ class BartDecoder(BartPretrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    cross_attention_bias=cross_attention_bias
                 )
             hidden_states = layer_outputs[0]
 
@@ -1195,6 +1241,7 @@ class BartModel(BartPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cross_attention_bias: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, Seq2SeqModelOutput]:
 
         # different to other models, Bart automatically creates decoder_input_ids from
@@ -1250,6 +1297,7 @@ class BartModel(BartPretrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cross_attention_bias=cross_attention_bias,
         )
 
         if not return_dict:
@@ -1330,6 +1378,7 @@ class BartForConditionalGeneration(BartPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cross_attention_bias: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1366,6 +1415,7 @@ class BartForConditionalGeneration(BartPretrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cross_attention_bias=cross_attention_bias
         )
         lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
 
@@ -1406,6 +1456,11 @@ class BartForConditionalGeneration(BartPretrainedModel):
         if past is not None:
             decoder_input_ids = decoder_input_ids[:, -1:]
 
+        
+        decoder_kwargs = kwargs.get('decoder_kwargs', None)
+        cross_attention_bias = decoder_kwargs.get('cross_attention_bias', None) if decoder_kwargs is not None else None
+
+        # breakpoint()
         return {
             "input_ids": None,  # encoder_outputs is defined. input_ids not needed
             "encoder_outputs": encoder_outputs,
@@ -1416,6 +1471,7 @@ class BartForConditionalGeneration(BartPretrainedModel):
             "decoder_head_mask": decoder_head_mask,
             "cross_attn_head_mask": cross_attn_head_mask,
             "use_cache": use_cache,  # change this to avoid caching (presumably for debugging)
+            "cross_attention_bias": cross_attention_bias # Added for cross attention bias (Hazarika et al. 2022)
         }
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
