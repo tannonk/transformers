@@ -178,6 +178,23 @@ def load_tf_weights_in_t5(model, config, tf_checkpoint_path):
     return model
 
 
+def _expand_cross_attention_bias(cross_attention_bias: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+    """
+    Expands cross_attention_bias from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    """
+    bsz, src_len = cross_attention_bias.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+
+    expanded_cross_attention_bias = cross_attention_bias[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+    
+    # inverted_cross_attention_bias = 1.0 - expanded_cross_attention_bias
+
+    # return inverted_cross_attention_bias.masked_fill(inverted_cross_attention_bias.to(torch.bool), torch.finfo(dtype).min)
+    
+    return expanded_cross_attention_bias
+
+
+
 ####################################################
 # PyTorch Models are constructed by sub-classing
 # - torch.nn.Module for the layers and
@@ -446,6 +463,7 @@ class T5Attention(nn.Module):
         query_length=None,
         use_cache=False,
         output_attentions=False,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
     ):
         """
         Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
@@ -536,6 +554,14 @@ class T5Attention(nn.Module):
             attn_weights, p=self.dropout, training=self.training
         )  # (batch_size, n_heads, seq_length, key_length)
 
+        ### Added for Hazarika et al. (2022) cross attention bias
+        if key_value_states is not None and cross_attention_bias is not None:
+            # elementwise multiplication
+            attn_weights = torch.mul(attn_weights, cross_attention_bias)
+
+            # re-normalize so that the outcome is still a probability distribution
+            attn_weights = nn.functional.normalize(attn_weights, p=1.0, dim=-1) # L1 norm -> elements sum to 1
+        
         # Mask heads if we want to
         if layer_head_mask is not None:
             attn_weights = attn_weights * layer_head_mask
@@ -601,6 +627,7 @@ class T5LayerCrossAttention(nn.Module):
         use_cache=False,
         query_length=None,
         output_attentions=False,
+        cross_attention_bias: Optional[torch.Tensor] = None, # Added for cross attention bias (Hazarika et al. 2022)
     ):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output = self.EncDecAttention(
@@ -613,6 +640,7 @@ class T5LayerCrossAttention(nn.Module):
             use_cache=use_cache,
             query_length=query_length,
             output_attentions=output_attentions,
+            cross_attention_bias=cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
         )
         layer_output = hidden_states + self.dropout(attention_output[0])
         outputs = (layer_output,) + attention_output[1:]  # add attentions if we output them
@@ -644,6 +672,7 @@ class T5Block(nn.Module):
         use_cache=False,
         output_attentions=False,
         return_dict=True,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
     ):
 
         if past_key_value is not None:
@@ -699,6 +728,7 @@ class T5Block(nn.Module):
                 query_length=query_length,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
+                cross_attention_bias=cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
             )
             hidden_states = cross_attention_outputs[0]
 
@@ -905,6 +935,8 @@ class T5Stack(T5PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
+        context_code: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) context augmentation
     ):
         # Model parallel
         if self.model_parallel:
@@ -959,8 +991,18 @@ class T5Stack(T5PreTrainedModel):
         # ourselves in which case we just need to make it broadcastable to all heads.
         extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape)
 
+        ### Added for Hazarika et al. (2022) context augmentation
+        # If context code is provided, we need to augment the encoder_attention_mask to match the 
+        # new encoded hidden state size (i.e. context_code_length + src_seq_length)
+        if self.is_decoder and encoder_hidden_states is not None and context_code is not None:
+            # [bsz x src_seq_len, hidden_size] -> [bsz x encoded_context_code_len + src_seq_len, hidden_size]
+            encoder_hidden_states = torch.cat([context_code, encoder_hidden_states], dim=1)
+            # update encoder_attention_mask to match encoded_context_code_len + src_seq_len          
+            context_code_attention_mask = torch.ones_like(context_code[:, :, 0]) # [bs x encoded_context_code_len]
+            encoder_attention_mask = torch.cat([context_code_attention_mask, encoder_attention_mask], dim=1) # [bs x encoded_context_code_len + src_seq_len]
+
         # If a 2D or 3D attention mask is provided for the cross-attention
-        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        # we need to make broadcastable to [batch_size, 1, seq_length, seq_length]
         if self.is_decoder and encoder_hidden_states is not None:
             encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
             encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
@@ -969,6 +1011,12 @@ class T5Stack(T5PreTrainedModel):
             encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
         else:
             encoder_extended_attention_mask = None
+
+        ### Added for Hazarika et al. (2022) cross attention bias
+        # similar to expanding the encoder_attention_mask, we also need to expand the cross_attention_bias
+        if self.is_decoder and encoder_hidden_states is not None and cross_attention_bias is not None:
+            # [bsz, seq_len] -> [bsz, 1, current_tgt_seq_len, src_seq_len]
+            cross_attention_bias = _expand_cross_attention_bias(cross_attention_bias, inputs_embeds.dtype, tgt_len=input_shape[-1])
 
         # Prepare head mask if needed
         head_mask = self.get_head_mask(head_mask, self.config.num_layers)
@@ -1044,6 +1092,7 @@ class T5Stack(T5PreTrainedModel):
                     past_key_value=past_key_value,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
+                    cross_attention_bias=cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
                 )
 
             # layer_outputs is a tuple with:
@@ -1555,6 +1604,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
+        context_code: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) context augmentation
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1634,6 +1685,12 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
                 attention_mask = attention_mask.to(self.decoder.first_device)
             if decoder_attention_mask is not None:
                 decoder_attention_mask = decoder_attention_mask.to(self.decoder.first_device)
+            
+            # NOTE: model parallelisation for cross attention bias and context code is not yet tested
+            if cross_attention_bias is not None: ### Added for Hazarika et al. (2022) cross attention bias
+                cross_attention_bias = cross_attention_bias.to(self.decoder.first_device)
+            if context_code is not None: ### Added for Hazarika et al. (2022) context augmentation
+                context_code = context_code.to(self.decoder.first_device)
 
         # Decode
         decoder_outputs = self.decoder(
@@ -1649,6 +1706,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cross_attention_bias=cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
+            context_code=context_code, ### Added for Hazarika et al. (2022) context augmentation
         )
 
         sequence_output = decoder_outputs[0]
@@ -1705,6 +1764,13 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         if past is not None:
             input_ids = input_ids[:, -1:]
 
+        ### Added for Hazarika et al. (2022)
+        decoder_kwargs = kwargs.get('decoder_kwargs', None)
+        # cross attention bias control knob
+        cross_attention_bias = decoder_kwargs.get('cross_attention_bias', None) if decoder_kwargs is not None else None
+        # aug context code control knob
+        context_code = decoder_kwargs.get('context_code', None) if decoder_kwargs is not None else None
+        
         return {
             "decoder_input_ids": input_ids,
             "past_key_values": past,
@@ -1714,6 +1780,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             "decoder_head_mask": decoder_head_mask,
             "cross_attn_head_mask": cross_attn_head_mask,
             "use_cache": use_cache,
+            "cross_attention_bias": cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
+            "context_code": context_code ### Added for Hazarika et al. (2022) context augmentation
         }
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
