@@ -193,7 +193,7 @@ class BartAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-        cross_attention_bias: Optional[torch.Tensor] = None,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -426,7 +426,7 @@ class BartDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = True,
-        cross_attention_bias: Optional[torch.Tensor] = None,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -478,7 +478,7 @@ class BartDecoderLayer(nn.Module):
                 layer_head_mask=cross_attn_layer_head_mask,
                 past_key_value=cross_attn_past_key_value,
                 output_attentions=output_attentions,
-                cross_attention_bias=cross_attention_bias
+                cross_attention_bias=cross_attention_bias ### Added for Hazarika et al. (2022) cross attention bias
             )
             hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
             hidden_states = residual + hidden_states
@@ -974,8 +974,8 @@ class BartDecoder(BartPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cross_attention_bias: Optional[torch.Tensor] = None,
-        context_code: Optional[torch.Tensor] = None,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
+        context_code: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) context augmentation
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         r"""
         Args:
@@ -1070,8 +1070,11 @@ class BartDecoder(BartPretrainedModel):
             attention_mask, input_shape, inputs_embeds, past_key_values_length
         )
 
-        ### NEW: AUG CXT ###
+        ### Added for Hazarika et al. (2022) context augmentation
+        # If context code is provided, we need to augment the encoder_attention_mask to match the 
+        # new encoded hidden state size (i.e. context_code_length + src_seq_length)
         if encoder_hidden_states is not None and context_code is not None:
+            # breakpoint()
             # [bsz x src_seq_len, hidden_size] -> [bsz x encoded_context_code_len + src_seq_len, hidden_size]
             encoder_hidden_states = torch.cat([context_code, encoder_hidden_states], dim=1)
             # update encoder_attention_mask to match encoded_context_code_len + src_seq_len          
@@ -1083,10 +1086,10 @@ class BartDecoder(BartPretrainedModel):
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             encoder_attention_mask = _expand_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
 
-        ### NEW: X-ATT BIAS ###
+        ### Added for Hazarika et al. (2022) cross attention bias
         if encoder_hidden_states is not None and cross_attention_bias is not None:
             # cross_attention_bias = cross_attention_bias.repeat(input_shape[0], 1) # NOTE: removed due to expansion in generation_utils
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            # [bsz, seq_len] -> [bsz, 1, current_tgt_seq_len, src_seq_len]
             cross_attention_bias = _expand_cross_attention_bias(cross_attention_bias, inputs_embeds.dtype, tgt_len=input_shape[-1])
     
         # embed positions
@@ -1161,7 +1164,7 @@ class BartDecoder(BartPretrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
-                    cross_attention_bias=cross_attention_bias
+                    cross_attention_bias=cross_attention_bias ### Added for Hazarika et al. (2022) cross attention bias
                 )
             hidden_states = layer_outputs[0]
 
@@ -1250,8 +1253,8 @@ class BartModel(BartPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cross_attention_bias: Optional[torch.Tensor] = None,
-        context_code: Optional[torch.Tensor] = None,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
+        context_code: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) context augmentation
     ) -> Union[Tuple, Seq2SeqModelOutput]:
 
         # different to other models, Bart automatically creates decoder_input_ids from
@@ -1307,8 +1310,8 @@ class BartModel(BartPretrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            cross_attention_bias=cross_attention_bias,
-            context_code=context_code,
+            cross_attention_bias=cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
+            context_code=context_code, ### Added for Hazarika et al. (2022) context augmentation
         )
 
         if not return_dict:
@@ -1389,8 +1392,8 @@ class BartForConditionalGeneration(BartPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cross_attention_bias: Optional[torch.Tensor] = None,
-        context_code: Optional[torch.Tensor] = None,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
+        context_code: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) context augmentation
     ) -> Union[Tuple, Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1427,8 +1430,8 @@ class BartForConditionalGeneration(BartPretrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            cross_attention_bias=cross_attention_bias,
-            context_code=context_code,
+            cross_attention_bias=cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
+            context_code=context_code, ### Added for Hazarika et al. (2022) context augmentation
         )
         lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
 
@@ -1469,7 +1472,7 @@ class BartForConditionalGeneration(BartPretrainedModel):
         if past is not None:
             decoder_input_ids = decoder_input_ids[:, -1:]
 
-        
+        ### Added for Hazarika et al. (2022)
         decoder_kwargs = kwargs.get('decoder_kwargs', None)
         # cross attention bias control knob
         cross_attention_bias = decoder_kwargs.get('cross_attention_bias', None) if decoder_kwargs is not None else None
@@ -1486,8 +1489,8 @@ class BartForConditionalGeneration(BartPretrainedModel):
             "decoder_head_mask": decoder_head_mask,
             "cross_attn_head_mask": cross_attn_head_mask,
             "use_cache": use_cache,  # change this to avoid caching (presumably for debugging)
-            "cross_attention_bias": cross_attention_bias, # Added for cross attention bias (Hazarika et al. 2022)
-            "context_code": context_code # Added for context code (Hazarika et al. 2022)
+            "cross_attention_bias": cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
+            "context_code": context_code ### Added for Hazarika et al. (2022) context augmentation
         }
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
