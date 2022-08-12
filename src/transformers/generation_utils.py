@@ -864,10 +864,14 @@ class GenerationMixin:
                 unused_model_args.append(key)
 
         if unused_model_args:
-            raise ValueError(
-                f"The following `model_kwargs` are not used by the model: {unused_model_args} (note: typos in the"
-                " generate arguments will also show up in this list)"
-            )
+            # NOTE: this validation broke the original method of passing 
+            # decoder kwargs required for zero-shot control generation (Hazarika et al., 2022)
+            # For the time-being, we're just skipping it.
+            pass 
+            # raise ValueError(
+            #     f"The following `model_kwargs` are not used by the model: {unused_model_args} (note: typos in the"
+            #     " generate arguments will also show up in this list)"
+            # )
 
     @torch.no_grad()
     def generate(
