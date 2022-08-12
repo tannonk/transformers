@@ -71,7 +71,7 @@ def contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
 # Copied from transformers.models.clip.modeling_clip.clip_loss with clip->owlvit
 def owlvit_loss(similarity: torch.Tensor) -> torch.Tensor:
     caption_loss = contrastive_loss(similarity)
-    image_loss = contrastive_loss(similarity.T)
+    image_loss = contrastive_loss(similarity.t())
     return (caption_loss + image_loss) / 2.0
 
 
@@ -1153,7 +1153,6 @@ class OwlViTClassPredictionHead(nn.Module):
 
 class OwlViTForObjectDetection(OwlViTPreTrainedModel):
     config_class = OwlViTConfig
-    main_input_name = "pixel_values"
 
     def __init__(self, config: OwlViTConfig):
         super().__init__(config)
@@ -1170,6 +1169,7 @@ class OwlViTForObjectDetection(OwlViTPreTrainedModel):
         if not feature_map.ndim == 4:
             raise ValueError("Expected input shape is [batch_size, num_channels, height, width]")
 
+        device = feature_map.device
         height, width = feature_map.shape[1:3]
 
         box_coordinates = np.stack(np.meshgrid(np.arange(1, width + 1), np.arange(1, height + 1)), axis=-1).astype(
@@ -1181,7 +1181,7 @@ class OwlViTForObjectDetection(OwlViTPreTrainedModel):
         box_coordinates = box_coordinates.reshape(
             box_coordinates.shape[0] * box_coordinates.shape[1], box_coordinates.shape[2]
         )
-        box_coordinates = torch.from_numpy(box_coordinates)
+        box_coordinates = torch.from_numpy(box_coordinates).to(device)
 
         return box_coordinates
 
@@ -1245,8 +1245,8 @@ class OwlViTForObjectDetection(OwlViTPreTrainedModel):
 
     def image_text_embedder(
         self,
-        pixel_values: torch.FloatTensor,
         input_ids: torch.Tensor,
+        pixel_values: torch.FloatTensor,
         attention_mask: torch.Tensor,
         output_attentions: Optional[bool] = None,
     ) -> torch.FloatTensor:
@@ -1283,9 +1283,9 @@ class OwlViTForObjectDetection(OwlViTPreTrainedModel):
     @replace_return_docstrings(output_type=OwlViTObjectDetectionOutput, config_class=OwlViTConfig)
     def forward(
         self,
-        pixel_values: torch.FloatTensor,
         input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
+        pixel_values: torch.FloatTensor,
+        attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -1323,8 +1323,8 @@ class OwlViTForObjectDetection(OwlViTPreTrainedModel):
         ...     box = [round(i, 2) for i in box.tolist()]
         ...     if score >= score_threshold:
         ...         print(f"Detected {text[label]} with confidence {round(score.item(), 3)} at location {box}")
-        Detected a photo of a cat with confidence 0.243 at location [1.42, 50.69, 308.58, 370.48]
-        Detected a photo of a cat with confidence 0.298 at location [348.06, 20.56, 642.33, 372.61]
+        Detected a photo of a cat with confidence 0.707 at location [324.97, 20.44, 640.58, 373.29]
+        Detected a photo of a cat with confidence 0.717 at location [1.46, 55.26, 315.55, 472.17]
         ```"""
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1337,8 +1337,8 @@ class OwlViTForObjectDetection(OwlViTPreTrainedModel):
 
         if output_hidden_states:
             outputs = self.owlvit(
-                pixel_values=pixel_values,
                 input_ids=input_ids,
+                pixel_values=pixel_values,
                 attention_mask=attention_mask,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
@@ -1349,8 +1349,8 @@ class OwlViTForObjectDetection(OwlViTPreTrainedModel):
 
         # Embed images and text queries
         feature_map, query_embeds = self.image_text_embedder(
-            pixel_values=pixel_values,
             input_ids=input_ids,
+            pixel_values=pixel_values,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
         )
@@ -1373,7 +1373,7 @@ class OwlViTForObjectDetection(OwlViTPreTrainedModel):
         pred_boxes = self.box_predictor(image_feats, feature_map)
 
         if not return_dict:
-            return (
+            output = (
                 pred_logits,
                 pred_boxes,
                 query_embeds,
@@ -1382,6 +1382,8 @@ class OwlViTForObjectDetection(OwlViTPreTrainedModel):
                 text_model_last_hidden_states,
                 vision_model_last_hidden_states,
             )
+            output = tuple(x for x in output if x is not None)
+            return output
 
         return OwlViTObjectDetectionOutput(
             image_embeds=feature_map,
