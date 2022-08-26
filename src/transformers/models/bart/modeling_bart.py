@@ -116,6 +116,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
+### Added for Hazarika et al. (2022) cross attention bias
 def _expand_cross_attention_bias(cross_attention_bias: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
     Expands cross_attention_bias from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
@@ -261,16 +262,12 @@ class BartAttention(nn.Module):
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
         
-        ### NEW ###
+        ### Added for Hazarika et al. (2022) cross attention bias
         if is_cross_attention and cross_attention_bias is not None:
-            # breakpoint()
-            # print('Biasing cross attention')
             if cross_attention_bias.size() != (bsz, 1, tgt_len, src_len):
                 raise ValueError(
                     f"Attention bias should be of size {(bsz, 1, tgt_len, src_len)}, but is {cross_attention_bias.size()}"
                 )
-
-            # breakpoint()
             # elementwise multiplication
             attn_weights = torch.mul(attn_weights.view(bsz, self.num_heads, tgt_len, src_len), cross_attention_bias)
             # attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) * cross_attention_bias
@@ -1080,7 +1077,6 @@ class BartDecoder(BartPretrainedModel):
         # If context code is provided, we need to augment the encoder_attention_mask to match the 
         # new encoded hidden state size (i.e. context_code_length + src_seq_length)
         if encoder_hidden_states is not None and context_code is not None:
-            # breakpoint()
             # [bsz x src_seq_len, hidden_size] -> [bsz x encoded_context_code_len + src_seq_len, hidden_size]
             encoder_hidden_states = torch.cat([context_code, encoder_hidden_states], dim=1)
             # update encoder_attention_mask to match encoded_context_code_len + src_seq_len          

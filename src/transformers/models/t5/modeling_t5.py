@@ -177,7 +177,7 @@ def load_tf_weights_in_t5(model, config, tf_checkpoint_path):
     logger.info(f"Weights not copied to PyTorch model: {', '.join(tf_weights.keys())}.")
     return model
 
-
+### Added for Hazarika et al. (2022) cross attention bias
 def _expand_cross_attention_bias(cross_attention_bias: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
     Expands cross_attention_bias from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
