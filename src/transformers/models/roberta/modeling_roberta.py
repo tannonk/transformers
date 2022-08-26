@@ -67,6 +67,21 @@ ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all RoBERTa models at https://huggingface.co/models?filter=roberta
 ]
 
+### Added for Hazarika et al. (2022) cross attention bias
+def _expand_cross_attention_bias(cross_attention_bias: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+    """
+    Expands cross_attention_bias from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    """
+    bsz, src_len = cross_attention_bias.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+
+    expanded_cross_attention_bias = cross_attention_bias[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+    
+    # inverted_cross_attention_bias = 1.0 - expanded_cross_attention_bias
+
+    # return inverted_cross_attention_bias.masked_fill(inverted_cross_attention_bias.to(torch.bool), torch.finfo(dtype).min)
+    
+    return expanded_cross_attention_bias
 
 class RobertaEmbeddings(nn.Module):
     """
@@ -200,6 +215,7 @@ class RobertaSelfAttention(nn.Module):
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
+        cross_attention_bias: Optional[torch.Tensor] = None, # Added for cross attention bias (Hazarika et al. 2022)
     ) -> Tuple[torch.Tensor]:
         mixed_query_layer = self.query(hidden_states)
 
@@ -265,6 +281,14 @@ class RobertaSelfAttention(nn.Module):
         # Normalize the attention scores to probabilities.
         attention_probs = nn.functional.softmax(attention_scores, dim=-1)
 
+        ### Added for Hazarika et al. (2022) cross attention bias
+        if is_cross_attention and cross_attention_bias is not None:
+            # elementwise multiplication
+            attention_probs = torch.mul(attention_probs, cross_attention_bias)
+
+            # re-normalize so that the outcome is still a probability distribution
+            attention_probs = nn.functional.normalize(attention_probs, p=1.0, dim=-1) # L1 norm -> elements sum to 1
+        
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
         attention_probs = self.dropout(attention_probs)
@@ -336,6 +360,7 @@ class RobertaAttention(nn.Module):
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
+        cross_attention_bias: Optional[torch.Tensor] = None, # Added for cross attention bias (Hazarika et al. 2022)
     ) -> Tuple[torch.Tensor]:
         self_outputs = self.self(
             hidden_states,
@@ -345,6 +370,7 @@ class RobertaAttention(nn.Module):
             encoder_attention_mask,
             past_key_value,
             output_attentions,
+            cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
         )
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
@@ -407,6 +433,7 @@ class RobertaLayer(nn.Module):
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
     ) -> Tuple[torch.Tensor]:
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
@@ -433,7 +460,7 @@ class RobertaLayer(nn.Module):
                     f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers"
                     " by setting `config.add_cross_attention=True`"
                 )
-
+            # breakpoint()
             # cross_attn cached key/values tuple is at positions 3,4 of past_key_value tuple
             cross_attn_past_key_value = past_key_value[-2:] if past_key_value is not None else None
             cross_attention_outputs = self.crossattention(
@@ -444,6 +471,7 @@ class RobertaLayer(nn.Module):
                 encoder_attention_mask,
                 cross_attn_past_key_value,
                 output_attentions,
+                cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
             )
             attention_output = cross_attention_outputs[0]
             outputs = outputs + cross_attention_outputs[1:-1]  # add cross attentions if we output attention weights
@@ -489,11 +517,12 @@ class RobertaEncoder(nn.Module):
         output_attentions: Optional[bool] = False,
         output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
     ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPastAndCrossAttentions]:
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
-
+        
         next_decoder_cache = () if use_cache else None
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
@@ -533,6 +562,7 @@ class RobertaEncoder(nn.Module):
                     encoder_attention_mask,
                     past_key_value,
                     output_attentions,
+                    cross_attention_bias=cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
                 )
 
             hidden_states = layer_outputs[0]
@@ -762,6 +792,8 @@ class RobertaModel(RobertaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
+        context_code: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) context augmentation
     ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPoolingAndCrossAttentions]:
         r"""
         encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
@@ -824,6 +856,16 @@ class RobertaModel(RobertaPreTrainedModel):
         # ourselves in which case we just need to make it broadcastable to all heads.
         extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape)
 
+        ### Added for Hazarika et al. (2022) context augmentation
+        # If context code is provided, we need to augment the encoder_attention_mask to match the 
+        # new encoded hidden state size (i.e. context_code_length + src_seq_length)
+        if self.config.is_decoder and encoder_hidden_states is not None and context_code is not None:
+            # [bsz x src_seq_len, hidden_size] -> [bsz x encoded_context_code_len + src_seq_len, hidden_size]
+            encoder_hidden_states = torch.cat([context_code, encoder_hidden_states], dim=1)
+            # update encoder_attention_mask to match encoded_context_code_len + src_seq_len          
+            context_code_attention_mask = torch.ones_like(context_code[:, :, 0]) # [bs x encoded_context_code_len]
+            encoder_attention_mask = torch.cat([context_code_attention_mask, encoder_attention_mask], dim=1) # [bs x encoded_context_code_len + src_seq_len]
+
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
         if self.config.is_decoder and encoder_hidden_states is not None:
@@ -834,6 +876,12 @@ class RobertaModel(RobertaPreTrainedModel):
             encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
         else:
             encoder_extended_attention_mask = None
+
+        ### Added for Hazarika et al. (2022) cross attention bias
+        # similar to expanding the encoder_attention_mask, we also need to expand the cross_attention_bias
+        if self.config.is_decoder and cross_attention_bias is not None:
+            # [bsz, seq_len] -> [bsz, 1, current_tgt_seq_len, src_seq_len]
+            cross_attention_bias = _expand_cross_attention_bias(cross_attention_bias, input_ids.dtype, tgt_len=input_shape[-1])
 
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
@@ -860,6 +908,7 @@ class RobertaModel(RobertaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cross_attention_bias=cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
         )
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
@@ -924,6 +973,8 @@ class RobertaForCausalLM(RobertaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cross_attention_bias: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) cross attention bias
+        context_code: Optional[torch.Tensor] = None, ### Added for Hazarika et al. (2022) context augmentation
     ) -> Union[Tuple[torch.Tensor], CausalLMOutputWithCrossAttentions]:
         r"""
         encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
@@ -971,7 +1022,7 @@ class RobertaForCausalLM(RobertaPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         if labels is not None:
             use_cache = False
-
+        
         outputs = self.roberta(
             input_ids,
             attention_mask=attention_mask,
@@ -986,6 +1037,8 @@ class RobertaForCausalLM(RobertaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cross_attention_bias=cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
+            context_code=context_code, ### Added for Hazarika et al. (2022) context augmentation
         )
 
         sequence_output = outputs[0]
@@ -1022,7 +1075,18 @@ class RobertaForCausalLM(RobertaPreTrainedModel):
         if past is not None:
             input_ids = input_ids[:, -1:]
 
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "past_key_values": past}
+        # # ### Added for Hazarika et al. (2022)
+        # decoder_kwargs = model_kwargs.get('decoder_kwargs', None)
+        # # # cross attention bias control knob
+        # cross_attention_bias = decoder_kwargs.get('cross_attention_bias', None) if decoder_kwargs is not None else None
+        # # # aug context code control knob
+        # context_code = decoder_kwargs.get('context_code', None) if decoder_kwargs is not None else None
+
+        return {
+            "input_ids": input_ids, "attention_mask": attention_mask, "past_key_values": past,
+            # "cross_attention_bias": cross_attention_bias, ### Added for Hazarika et al. (2022) cross attention bias
+            # "context_code": context_code ### Added for Hazarika et al. (2022) context augmentation
+            }
 
     def _reorder_cache(self, past, beam_idx):
         reordered_past = ()

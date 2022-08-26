@@ -484,6 +484,11 @@ class EncoderDecoderModel(PreTrainedModel):
         kwargs_decoder = {
             argument[len("decoder_") :]: value for argument, value in kwargs.items() if argument.startswith("decoder_")
         }
+        
+        ### Added for Hazarika et al. (2022)
+        # seems hacky
+        if kwargs_decoder.get('kwargs') is not None:
+            kwargs_decoder = kwargs_decoder['kwargs']
 
         if encoder_outputs is None:
             encoder_outputs = self.encoder(
@@ -513,6 +518,7 @@ class EncoderDecoderModel(PreTrainedModel):
             )
 
         # Decode
+        # breakpoint()
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
@@ -559,8 +565,9 @@ class EncoderDecoderModel(PreTrainedModel):
     def prepare_inputs_for_generation(
         self, input_ids, past=None, attention_mask=None, use_cache=None, encoder_outputs=None, **kwargs
     ):
-        decoder_inputs = self.decoder.prepare_inputs_for_generation(input_ids, past=past)
+        decoder_inputs = self.decoder.prepare_inputs_for_generation(input_ids, past=past, **kwargs)
         decoder_attention_mask = decoder_inputs["attention_mask"] if "attention_mask" in decoder_inputs else None
+
         input_dict = {
             "attention_mask": attention_mask,
             "decoder_attention_mask": decoder_attention_mask,
@@ -569,6 +576,10 @@ class EncoderDecoderModel(PreTrainedModel):
             "past_key_values": decoder_inputs["past_key_values"],
             "use_cache": use_cache,
         }
+        
+        ### Added for Hazarika et al. (2022)
+        input_dict.update(kwargs)
+
         return input_dict
 
     def resize_token_embeddings(self, *args, **kwargs):
